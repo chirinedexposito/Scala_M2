@@ -1,77 +1,93 @@
-// src/main/scala/fr/mosef/scala/template/reader/impl/ReaderImpl.scala
-
 package fr.mosef.scala.template.reader.impl
 
-import java.io.{FileNotFoundException, InputStream}
-import java.util.Properties
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.types.StructType
 import fr.mosef.scala.template.reader.Reader
+import scala.util.{Try, Success, Failure}
+import java.io.File
 
-class ReaderImpl(sparkSession: SparkSession, propertiesFilePath: String) extends Reader {
+class ReaderImpl(sparkSession: SparkSession) extends Reader {
 
-  val properties: Properties = new Properties()
+  def readCSV(path: String, delimiter: String = ",", header: Boolean = true, schema: Option[StructType] = None): DataFrame = {
+    validatePath(path)
+    validateFileExtension(path, List(".csv", ".txt", ".data"))
 
-  try {
-    val inputStream: InputStream = getClass.getClassLoader.getResourceAsStream(propertiesFilePath)
-    if (inputStream == null) throw new FileNotFoundException(s"Fichier de propriétés introuvable dans le classpath : $propertiesFilePath")
-    properties.load(inputStream)
-    println(s"✅ Chargement des propriétés depuis le classpath : $propertiesFilePath")
-  } catch {
-    case e: Exception =>
-      println(s"❌ Erreur : Impossible de charger $propertiesFilePath")
-      throw e
-  }
+    Try {
+      val options = Map(
+        "sep" -> delimiter,
+        "header" -> header.toString,
+        "inferSchema" -> schema.isEmpty.toString,
+        "mode" -> "FAILFAST",
+        "quote" -> "\"",
+        "multiline" -> "true"
+      )
 
-  def read(format: String, options: Map[String, String], path: String): DataFrame = {
-    sparkSession
-      .read
-      .options(options)
-      .format(format)
-      .load(path)
-  }
+      val reader = sparkSession.read.options(options)
+      val withSchema = schema.map(reader.schema).getOrElse(reader)
 
-  def read(path: String): DataFrame = {
-    sparkSession
-      .read
-      .option("sep", properties.getProperty("read_separator", ","))
-      .option("inferSchema", properties.getProperty("schema", "true"))
-      .option("header", properties.getProperty("read_header", "true"))
-      .format(properties.getProperty("read_format_csv", "csv"))
-      .load(path)
+      withSchema.format("csv").load(path)
+    } match {
+      case Success(df) => df
+      case Failure(e) =>
+        logError(s"Error reading CSV file $path: ${e.getMessage}")
+        throw new RuntimeException(s"Failed to read CSV: ${e.getMessage}", e)
+    }
   }
 
   def readParquet(path: String): DataFrame = {
-    sparkSession
-      .read
-      .format(properties.getProperty("read_format_parquet", "parquet"))
-      .load(path)
+    validatePath(path)
+    validateFileExtension(path, List(".parquet", ".pqt"))
+
+    Try {
+      sparkSession.read.parquet(path)
+    } match {
+      case Success(df) => df
+      case Failure(e) =>
+        logError(s"Error reading Parquet file $path: ${e.getMessage}")
+        throw new RuntimeException(s"Failed to read Parquet: ${e.getMessage}", e)
+    }
   }
 
-  def readTable(tableName: String, location: String): DataFrame = {
-    sparkSession
-      .read
-      .format("parquet")
-      .option("basePath", location)
-      .load(location + "/" + tableName)
+  def readHiveTable(tableName: String): DataFrame = {
+    if (tableName == null || tableName.trim.isEmpty) {
+      throw new IllegalArgumentException("Table name cannot be null or empty")
+    }
+
+    Try {
+      sparkSession.table(tableName)
+    } match {
+      case Success(df) => df
+      case Failure(e) =>
+        logError(s"Error reading Hive table $tableName: ${e.getMessage}")
+        throw new RuntimeException(s"Failed to read Hive table: ${e.getMessage}", e)
+    }
   }
 
-  def read(): DataFrame = {
-    sparkSession.sql("SELECT 'Empty DataFrame for unit testing implementation'")
+  private def validatePath(path: String): Unit = {
+    if (path == null || path.trim.isEmpty) {
+      throw new IllegalArgumentException("Path cannot be null or empty")
+    }
+
+    if (!path.matches("^(hdfs://|s3a://|gs://|wasbs://).*")) {
+      val file = new File(path)
+      if (!file.exists()) {
+        throw new IllegalArgumentException(s"Path $path does not exist")
+      }
+    }
   }
 
-  def getInputPathFromProperties(): String = {
-    val path = properties.getProperty("input_path")
-    if (path == null) throw new NullPointerException("input_path n’est pas défini dans le fichier de propriétés.")
-    path
+  private def validateFileExtension(path: String, validExtensions: List[String]): Unit = {
+    val isValid = validExtensions.exists(ext => path.toLowerCase.endsWith(ext))
+    if (!isValid) {
+      logWarning(s"File $path does not have one of the expected extensions: ${validExtensions.mkString(", ")}")
+    }
   }
 
-  def getOutputPathFromProperties(): String = {
-    val path = properties.getProperty("output_path")
-    if (path == null) throw new NullPointerException("output_path n’est pas défini dans le fichier de propriétés.")
-    path
+  private def logError(message: String): Unit = {
+    println(s"[ERROR] $message")
   }
 
-  def readFromProperties(): DataFrame = {
-    read(getInputPathFromProperties())
+  private def logWarning(message: String): Unit = {
+    println(s"[WARNING] $message")
   }
 }

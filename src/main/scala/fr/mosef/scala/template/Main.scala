@@ -1,52 +1,111 @@
-// src/main/scala/Main.scala
+package fr.mosef.scala.template
 
-import fr.mosef.scala.template.reader.impl.ReaderImpl
-import fr.mosef.scala.template.processor.impl.ProcessorImpl
-import fr.mosef.scala.template.writer.impl.WriterImpl
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import fr.mosef.scala.template.processor.Processor
+import fr.mosef.scala.template.processor.impl.ProcessorImpl
+import fr.mosef.scala.template.reader.Reader
+import fr.mosef.scala.template.reader.impl.ReaderImpl
+import fr.mosef.scala.template.writer.Writer
 import org.apache.spark.SparkConf
+import com.globalmentor.apache.hadoop.fs.BareLocalFileSystem
+import org.apache.hadoop.fs.FileSystem
 
-object Main {
-  def main(args: Array[String]): Unit = {
-    println("🚀 Démarrage de l'application Scala Spark...")
+import java.util.Properties
+import java.io.FileInputStream
 
-    val conf = new SparkConf()
-      .setAppName("Scala Template")
-      .setMaster("local[*]")
+object Main extends App {
 
-    val sparkSession = SparkSession.builder()
-      .config(conf)
-      .enableHiveSupport()
-      .getOrCreate()
+  val cliArgs = args // On récupère les arguments fournis par la commande line interface
 
-    // Chargement du fichier de configuration depuis le classpath
-    val propertiesFile = "configuration.properties"
-
-    // Initialisation des composants
-    println("🔧 Initialisation des composants Reader / Processor / Writer...")
-    val reader = new ReaderImpl(sparkSession, propertiesFile)
-    val processor = new ProcessorImpl()
-    val writer = new WriterImpl(propertiesFile)
-
-    val inputDF = reader.readFromProperties()
-    val dst_path = reader.getOutputPathFromProperties()
-
-    println("⚙️  Lancement du traitement des données...")
-    val (report1, report2, report3) = processor.process(inputDF)
-
-    println("✅ Traitement terminé.")
-    println("📤 Écriture des résultats dans les fichiers de sortie...")
-
-    writer.write(report1, "overwrite", dst_path + "_report1", "total_montants_par_client")
-    println("📝 Rapport 1 écrit : total_montants_par_client")
-
-    writer.write(report2, "overwrite", dst_path + "_report2", "premier_credit_par_client")
-    println("📝 Rapport 2 écrit : premier_credit_par_client")
-
-    writer.write(report3, "overwrite", dst_path + "_report3", "montant_moyen_par_type")
-    println("📝 Rapport 3 écrit : montant_moyen_par_type")
-
-    println("🎉 Pipeline terminé avec succès !")
-    sparkSession.stop()
+  val MASTER_URL: String = try cliArgs(0) catch {
+    case _: ArrayIndexOutOfBoundsException => "local[1]"
   }
+
+  val SRC_PATH: String = try cliArgs(1) catch {
+    case _: ArrayIndexOutOfBoundsException =>
+      println("No input defined")
+      sys.exit(1)
+  } // Chemin des données d'entrée
+
+  val DST_PATH: String = try cliArgs(2) catch {
+    case _: ArrayIndexOutOfBoundsException => "./default/output-writer"
+  } // Output
+
+
+  val REPORT_TYPES: Seq[String] = try cliArgs(3).split(",").map(_.trim).toSeq catch {
+    case _: ArrayIndexOutOfBoundsException =>
+      println("Aucun type de rapport précisé, 'report1' utilisé par défaut")
+      Seq("report1")
+  }
+
+  val CONFIG_PATH: Option[String] = if (cliArgs.length > 4) Some(cliArgs(4)) else None
+
+  val conf = new SparkConf()
+  conf.set("spark.driver.memory", "2g")
+  conf.set("spark.testing.memory", "471859200")
+
+  val sparkSession = SparkSession
+    .builder
+    .master(MASTER_URL)
+    .config(conf)
+    .appName("Scala Template")
+    .enableHiveSupport()
+    .getOrCreate()
+
+  sparkSession.sparkContext.hadoopConfiguration.setClass(
+    "fs.file.impl",
+    classOf[BareLocalFileSystem],
+    classOf[FileSystem]
+  ) // ??
+
+  def detectFormatFromPath(path: String): String = { // On déduit automatiquement le format du fichier d'entrée
+    val lower = path.toLowerCase
+    if (lower.endsWith(".csv")) "csv"
+    else if (lower.endsWith(".parquet")) "parquet"
+    else if (lower.startsWith("hive:")) "hive"
+    else "unknown"
+  }
+
+  // ✅ Chargement configuration depuis fichier interne ou externe
+  val confWriter = new Properties()
+  val stream = CONFIG_PATH match {
+    case Some(path) =>
+      println(s"📄 Chargement config externe : $path")
+      new FileInputStream(path)
+    case None =>
+      println("📄 Chargement config interne : configuration.properties")
+      getClass.getClassLoader.getResourceAsStream("configuration.properties")
+  }
+  if (stream == null) {
+    throw new RuntimeException("Fichier de configuration introuvable")
+  }
+  confWriter.load(stream)
+  val reader: Reader = new ReaderImpl(sparkSession)
+  val processor: Processor = new ProcessorImpl()
+  val writer: Writer = new Writer(sparkSession, confWriter)
+
+  val format = detectFormatFromPath(SRC_PATH)
+  println(s"Format détecté: $format")
+
+  val inputDF: DataFrame = format match {
+    case "csv" =>
+      reader.readCSV(SRC_PATH, delimiter = ",", header = true)
+    case "parquet" =>
+      reader.readParquet(SRC_PATH)
+    case "hive" =>
+      val tableName = SRC_PATH.stripPrefix("hive:")
+      reader.readHiveTable(tableName)
+    case _ =>
+      println(s"Format inconnu pour le chemin : $SRC_PATH")
+      sys.exit(1)
+  } // On appelle la bonne fonction read du Reader selon le type de fichier détécté
+
+
+  REPORT_TYPES.foreach { report =>
+    val processedDF = processor.process(inputDF, report)
+    val outputPath = s"$DST_PATH/$report"
+    println(s"Écriture du rapport '$report' vers $outputPath")
+    writer.write(processedDF, outputPath)
+  }
+
 }
